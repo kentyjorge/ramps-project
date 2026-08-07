@@ -2,6 +2,34 @@
 
 This project calls Revenue Connect REST APIs from Apex using a self-referencing Named Credential.
 
+> **Target org:** an existing **sandbox / Developer Edition / dev** org with
+> Revenue Cloud (RLM) enabled. **Never deploy to production** from this flow.
+>
+> Prior deployment logs and change history have moved to
+> [`SESSION-HISTORY.md`](./SESSION-HISTORY.md) to keep this README focused on
+> setup and deploy.
+
+## What's included
+
+- **Apex:** `RevConnectCallout` (Revenue Connect callout via Named Credential),
+  `QuoteRampController` (ramp orchestration) + tests
+- **LWC:** `quoteRampBuilder` (the ramp UI)
+- **Flow:** `Launch_Create_Ramps` (screen-flow wrapper)
+- **Quick Action:** `Quote.Ramp_Lines`
+
+Deploy mechanism: **source-format SFDX project** (`sf project deploy start`) **plus
+a one-time manual org setup** (Connected App / Auth Provider / External + Named
+Credential) that no deploy can perform for you.
+
+## Prerequisites
+
+| Requirement | Check |
+|---|---|
+| Salesforce CLI (`sf`) 2.x | `sf --version` |
+| Target org authenticated + aliased | `sf org display --target-org <alias>` |
+| Revenue Cloud (RLM) + Revenue Connect available in the org | — |
+| Ability to create a Connected App / Auth Provider / Named Credential | admin access |
+
 ## Integration Configuration
 
 - Named Credential: `SelfOrgNC`
@@ -271,6 +299,9 @@ Note: `"QuoteLineGroupId": null` is JSON null (no quotes). `pricingPref: "Skip"`
 ## Deploy
 
 ```bash
+git clone https://github.com/kentyjorge/ramps-project.git
+cd ramps-project
+
 sf project deploy start --source-dir force-app --target-org main
 ```
 
@@ -279,6 +310,28 @@ Run unit tests:
 ```bash
 sf apex run test --target-org main --tests QuoteRampControllerTest RevConnectCalloutTest --wait 10 --result-format human
 ```
+
+## Post-deploy steps
+
+1. Complete the org setup steps above if you haven't (the deploy does not create the credentials).
+2. **Add the `Ramp Lines` quick action** to the Quote page layout: Setup → Object
+   Manager → Quote → Page Layouts → *Mobile & Lightning Actions* → drag **Ramp
+   Lines** → Save.
+3. Confirm the `Launch_Create_Ramps` flow is active (Setup → Flows).
+
+## Verify
+
+Open/create a Quote with ≥2 subscription products and ≥1 one-time product → **Ramp
+Lines** → configure 2 segments (e.g. Y1: 12 mo, 0% uplift; Y2: 12 mo, 10% uplift)
+→ select subscription products to duplicate → **Apply Ramp**. Expect: 2
+`QuoteLineGroup`s (`IsRamped = true`), subscription lines in both, one-time lines
+only in segment 1.
+
+## Safety
+
+- Metadata-only deploy — no data is loaded or deleted by the deploy.
+- The ramp builder **modifies Quote line groups and pricing** when run; exercise
+  it on test quotes first.
 
 ## Troubleshooting
 
@@ -295,148 +348,3 @@ sf apex run test --target-org main --tests QuoteRampControllerTest RevConnectCal
   - remove or reduce verbose debug logging used during integration debugging
   - tighten user-facing error messages for clearer UI guidance
 - Test fallback path: if Revenue Cloud rejects `"QuoteLineGroupId": null`, implement temp-group workaround (move one-time lines to a non-ramped temp group, clone, move back, delete temp group)
-
----
-
-## Session History
-
-### 2025-06-24 — Fix Clone Failure: Revenue Connect Transaction Isolation
-
-**Problem:** Clone API returned 400 because one-time lines were still visible in the ramped group at clone time. DML-based ungrouping (`update oneTimeLines` with `QuoteLineGroupId = null`) was not committed — Revenue Connect reads committed DB state, not uncommitted Apex DML.
-
-**Fix applied:**
-1. Replaced DML ungroup (step 2b) with Revenue Connect `place` API call using new `buildUngroupLinesPayload` helper
-2. Replaced DML regroup (step 4b) with Revenue Connect `place` API call reusing existing `buildGroupQuoteLinesPayload`
-3. Added `buildUngroupLinesPayload` helper method — builds payload with `"QuoteLineGroupId": null` and `pricingPref: "Skip"`
-
-**Deployed:** `QuoteRampController.cls` to main org — Status: Succeeded (Deploy ID: 0AfHo00000yZLqIKAW)
-
-**Verification steps:**
-1. Open a Quote with both one-time and subscription products
-2. Launch Ramp Builder, apply ramp with 2+ segments
-3. Confirm all segments are created without 400 errors
-4. Confirm one-time products appear only in segment 1
-5. Confirm subscription/evergreen products appear in all segments
-
-### 2026-07-06 — Cross-Project Collision: `RevConnectCallout.cls` Overwritten in Org `main`
-
-**Problem:** A separate local project (`quote-workspace-ui-project`) deployed its own Apex callout utility, also named `RevConnectCallout.cls`, to the shared trial org `main`. Its version used session-id bearer auth (`Url.getOrgDomainUrl()` / `UserInfo.getSessionId()`), incompatible with this project's Named-Credential-based (`SelfOrgNC`) implementation. The overwrite broke `QuoteRampController` (this project) as well as `QuoteCreationController` and `ProductSearchController` (in `quote-guided-selling-project`), whose tests failed to compile against the wrong version.
-
-**Fix applied:** The original `RevConnectCallout.cls` + `RevConnectCalloutTest.cls` in this local repo were untouched by the incident, so they were redeployed as-is to org `main` (`sf project deploy start --target-org main`) to restore the correct, org-wide implementation.
-
-**Verification (`sf apex run test --target-org main`):**
-- `RevConnectCalloutTest` — pass
-- `QuoteRampControllerTest` (6/6) — pass
-- `ProductSearchControllerTest` (3/3) — pass
-- Confirmed no drift vs. org for `QuoteRampController.cls`, the `quoteRampBuilder` LWC, the `Launch_Create_Ramps` flow, and the `Quote.Ramp_Lines` quick action.
-
-**Open item — flagged for later investigation:** org `main` has a live `RevConnectCalloutMock` class that does **not** exist in this local repo. It was likely created directly in-org, outside source control, and should be reconciled (either committed here or removed) at some point.
-
-### 2026-07-10 — Performance: Cut Revenue Connect Round Trips in `applyGroupRamp`
-
-**Problem:** Applying a ramp took ~60 seconds. `QuoteRampController.applyGroupRamp` made a separate sequential Revenue Connect `place` callout for several things that didn't need to be separate: a per-group Uplift/Discount PATCH, a per-group SegmentType PATCH, a per-target-segment `AddProducts` call, and a redundant "group all lines into segment 1" call that duplicated work already done by the initial `GroupAll` action.
-
-**Fix applied (`QuoteRampController.cls`):**
-1. **Merged Uplift/Discount + SegmentType propagation** — `applySegmentUpliftDiscount` and `propagateSegmentTypeToLines` (up to 2 calls per ramped group) replaced with a single `applySegmentAttributesAcrossGroups` method that builds ONE graph covering every affected line across every group, setting whichever of `UnitPriceUplift` / `Discount` (non-one-time lines only) / `SegmentType` (all lines) apply.
-2. **Merged `AddProducts` across all target segments** — the per-segment loop (`segNum = 2..N`, one callout each) is replaced by `buildAddProductsPayloadMulti`, which builds one graph with every target group's anchor and every new line for every segment, sent as a single call.
-3. **Skipped the redundant initial re-group call** — `ensureSegmentOneGroup` now returns whether it just created the group via `GroupAll` (fresh quote — every line already moved into it) vs. reused a pre-existing group. The explicit "all lines → segment 1" PATCH (step 1) now only runs in the reuse case.
-4. Added small `quotePatchAnchor`/`groupPatchAnchor` helpers to avoid duplicating the graph anchor-record JSON across the new merged payload builders.
-5. `QuoteRampControllerTest.cls` required no changes — its callout-dependent test already expects any exception from the (unmocked) Revenue Connect call in test context, and doesn't assert on internal call counts or payload shapes. Full suite re-verified passing (6/6) after the change.
-
-**Verified with a real before/after timing test in org `main`** (two identical fresh quotes, 4 subscription lines + 2 one-time lines, 3 custom ramp segments with uplift/discount on each):
-
-| | Callouts | Elapsed |
-|---|---|---|
-| Original code | 14 | 63.4s |
-| Optimized code | 8 | 47.7s |
-
-**~43% fewer Revenue Connect round trips, ~25% faster wall-clock time** in this scenario (the ratio will vary with segment count and which fields are set — more segments/attributes = bigger savings, since the merged calls replace what used to be O(groups) calls with O(1)).
-
-**Bug found during verification (pre-existing, not introduced by this change):** one-time lines (e.g., "Professional Services Hourly") get duplicated into segments 2+ during the clone step, even though they're explicitly ungrouped beforehand via a Revenue Connect `"QuoteLineGroupId": null` PATCH. Reproduced identically on the original (pre-optimization) code running the same scenario on a twin quote — so this is unrelated to the performance change. This is the exact failure mode already flagged in the **Follow-up TODO** above ("if Revenue Cloud rejects `QuoteLineGroupId: null`, implement temp-group workaround") and still needs a fix — likely by moving one-time lines to a genuinely separate/temp group (not just nulling `QuoteLineGroupId`) before cloning.
-
-**Test artifacts:** two "...Copy" quotes in org `main` (`0Q0Ho000001NnqIKAS`, `0Q0Ho000001NnqNKAS`) were used for this A/B timing test and now have live 3-segment ramps applied — safe to delete/reset if they were only scratch data.
-
-### 2026-07-21 — Deployed Ramps Project to `maintwo` Org
-
-**Objective:** Deploy all Quote Ramp Helper components from `ramps-project` to the `maintwo` org (maintwo@salesforce.com, trailsignup-269936b7ffbdfe.my.salesforce.com).
-
-**Pre-Deployment:**
-- Updated `sfdx-project.json` sourceApiVersion from `65.0` → `67.0` to align with target org API version
-- Verified authentication infrastructure already exists in `maintwo`:
-  - Named Credential: `SelfOrgNC` ✓
-  - External Credential: `SelfOrgOAuthEC` ✓
-  - Auth Provider: `RevCloud` ✓
-  - Connected App: `RevCloud` (implied by Auth Provider existence) ✓
-
-**Deployment Steps (Sequential):**
-
-1. **Apex Classes** (Step 2) — Deploy ID: `0Afbm00000ZDEc7CAH`
-   - `RevConnectCallout.cls` + test
-   - `QuoteRampController.cls` + test
-   - Status: ✅ **Succeeded** (4 classes created)
-   - Elapsed: 3.69s
-
-2. **Lightning Web Component** (Step 3) — Deploy ID: `0Afbm00000ZDyv4CAD`
-   - `quoteRampBuilder` (4 files: .js, .html, .css, .js-meta.xml)
-   - Status: ✅ **Succeeded**
-   - Elapsed: 5.01s
-
-3. **Flow** (Step 4) — Deploy ID: `0Afbm00000ZE7qICAT`
-   - `Launch_Create_Ramps` (Screen Flow wrapper)
-   - Status: ✅ **Succeeded**
-   - Elapsed: 7.65s
-
-4. **Quick Action** (Step 5) — Deploy ID: `0Afbm00000ZDidOCAT`
-   - `Quote.Ramp_Lines` (Quote record action)
-   - Status: ✅ **Succeeded**
-   - Elapsed: 6.36s
-
-**Post-Deployment Verification:**
-
-✅ **All Apex Tests Pass** — 6/6 tests (100% pass rate):
-- `RevConnectCalloutTest.postRev_buildsEndpointAndSendsPost`
-- `QuoteRampControllerTest.applyGroupRamp_validates_inputs`
-- `QuoteRampControllerTest.getQuoteRampContext_null_throws`
-- `QuoteRampControllerTest.getQuoteRampContext_returns_lines_and_groups`
-- `QuoteRampControllerTest.parseSegments_includes_uplift_discount_and_name`
-- `QuoteRampControllerTest.segmentInput_fields_exist`
-
-✅ **Apex Classes Confirmed in Org** (via Tooling API query):
-- `RevConnectCallout` (01pbm00000PM9nrAAD)
-- `RevConnectCalloutTest` (01pbm00000PM9nsAAD)
-- `QuoteRampController` (01pbm00000PM9npAAD)
-- `QuoteRampControllerTest` (01pbm00000PM9nqAAD)
-
-**Deployment Summary:**
-- **Total Components Deployed:** 7 metadata files (4 Apex classes, 1 LWC bundle, 1 Flow, 1 Quick Action)
-- **Total Deployment Time:** ~23 seconds
-- **Status:** ✅ **All Success Criteria Met**
-
-**Next Steps for `maintwo` Org Users:**
-
-1. **Verify Named Credential Connectivity** (Execute Anonymous):
-   ```apex
-   HttpRequest req = new HttpRequest();
-   req.setEndpoint('callout:SelfOrgNC/services/data/v67.0/limits');
-   req.setMethod('GET');
-   HttpResponse res = new Http().send(req);
-   System.debug(res.getStatusCode() + ' ' + res.getBody().left(200));
-   ```
-   - Expected: `200` status code
-   - If `401`: Authenticate principal (Setup → External Credentials → SelfOrgOAuthEC → Principals → default → Authenticate)
-   - If `403`: Add "SelfOrgOAuthEC - default" to user's Permission Set under External Credential Principal Access
-
-2. **Add Quick Action to Quote Page Layout** (if not auto-added):
-   - Setup → Object Manager → Quote → Page Layouts → Select layout
-   - Mobile & Lightning Actions section → Drag "Ramp Lines" action to layout
-   - Save
-
-3. **Test End-to-End Ramp Creation:**
-   - Open/create a Quote with at least 2 subscription products and 1 one-time product
-   - Click Actions → "Ramp Lines"
-   - Configure 2 segments (e.g., Year 1: 12 months, 0% uplift; Year 2: 12 months, 10% uplift)
-   - Select subscription products for duplication
-   - Click "Apply Ramp"
-   - Verify: 2 QuoteLineGroups created (IsRamped = true), subscription lines in both groups, one-time lines only in Segment 1
-
-**Known Issue (Pre-Existing):** One-time lines may get duplicated into segments 2+ during clone step despite explicit ungrouping. Workaround in development (temp-group approach) — see "Follow-up TODO" section above.
